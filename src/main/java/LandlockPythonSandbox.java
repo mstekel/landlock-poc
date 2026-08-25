@@ -63,11 +63,13 @@ public class LandlockPythonSandbox {
             return;
         }
 
-        // Setup directories
+        // Setup directories, each with a private file for the read/write checks below.
         Path dir1 = Path.of("/tmp/python_proc1");
         Path dir2 = Path.of("/tmp/python_proc2");
         Files.createDirectories(dir1);
         Files.createDirectories(dir2);
+        Files.writeString(dir1.resolve("secret.txt"), "secret data belonging to process 1\n");
+        Files.writeString(dir2.resolve("secret.txt"), "secret data belonging to process 2\n");
 
         System.out.println("Spawning isolated Python sub-processes...");
 
@@ -124,15 +126,48 @@ public class LandlockPythonSandbox {
 
         System.out.printf("[%s] Landlock enforced successfully. Launching Python execution test...%n", mode);
 
-        // Run Python inline script to test filesystem isolation
-        String pythonScript = String.format(
-                "import os\n" +
-                        "print('[Python] Successfully reading own folder contents:', os.listdir('%s'))\n" +
-                        "try:\n" +
-                        "    print(os.listdir('%s'))\n" +
-                        "except PermissionError as e:\n" +
-                        "    print('[Python] SUCCESS: Access to other process folder blocked:', e)\n",
-                ownDir, targetOtherDir
+        String ownFile = ownDir + "/secret.txt";
+        String otherFile = targetOtherDir + "/secret.txt";
+        String plantedFile = targetOtherDir + "/planted_by_" + mode.substring("--child-".length()) + ".txt";
+
+        // Run an inline Python script to test filesystem isolation. The script
+        // itself calls no Landlock API and has no idea it's sandboxed -- the
+        // restriction was already applied to this JVM process above, and is
+        // inherited by python3 across exec. Each check is both a directory-
+        // level operation (listdir) and a file-level one (read/write), against
+        // both its own folder and the other process's folder.
+        String pythonScript = """
+                import os
+
+                def try_read(label, path):
+                    try:
+                        with open(path) as f:
+                            print(f'[Python] READ  {label:<26} -> OK: {f.read().strip()!r}')
+                    except PermissionError as e:
+                        print(f'[Python] READ  {label:<26} -> BLOCKED: {e}')
+
+                def try_write(label, path, mode='w'):
+                    try:
+                        with open(path, mode) as f:
+                            f.write('written by python\\n')
+                        print(f'[Python] WRITE {label:<26} -> OK')
+                    except PermissionError as e:
+                        print(f'[Python] WRITE {label:<26} -> BLOCKED: {e}')
+
+                def try_list(label, path):
+                    try:
+                        print(f'[Python] LIST  {label:<26} -> OK: {os.listdir(path)}')
+                    except PermissionError as e:
+                        print(f'[Python] LIST  {label:<26} -> BLOCKED: {e}')
+
+                try_list('own folder', %1$s)
+                try_read('own file', %2$s)
+                try_write('own file (append)', %2$s, 'a')
+                try_list('other process\\'s folder', %3$s)
+                try_read('other process\\'s file', %4$s)
+                try_write('plant file in other\\'s folder', %5$s)
+                """.formatted(
+                pyLiteral(ownDir), pyLiteral(ownFile), pyLiteral(targetOtherDir), pyLiteral(otherFile), pyLiteral(plantedFile)
         );
 
         Process pythonProc = new ProcessBuilder("python3", "-c", pythonScript)
@@ -140,6 +175,11 @@ public class LandlockPythonSandbox {
                 .start();
 
         pythonProc.waitFor();
+    }
+
+    /** Renders a path as a single-quoted Python string literal for embedding in the inline script. */
+    private static String pyLiteral(String path) {
+        return "'" + path.replace("\\", "\\\\").replace("'", "\\'") + "'";
     }
 
     private static void allowPath(int rulesetFd, String path, long accessFlags) {
