@@ -133,39 +133,50 @@ public class LandlockPythonSandbox {
         // Run an inline Python script to test filesystem isolation. The script
         // itself calls no Landlock API and has no idea it's sandboxed -- the
         // restriction was already applied to this JVM process above, and is
-        // inherited by python3 across exec. Each check is both a directory-
-        // level operation (listdir) and a file-level one (read/write), against
-        // both its own folder and the other process's folder.
+        // inherited by python3 across exec. Each check declares what SHOULD
+        // happen (own folder -> allowed, other process's folder -> blocked)
+        // and prints PASSED/FAILED based on whether the actual outcome
+        // matched that expectation, so a BLOCKED result is clearly flagged
+        // as correct rather than looking like a failure.
         String pythonScript = """
-                import os
+                import os, sys
 
-                def try_read(label, path):
+                results = []
+
+                def check(label, expect_blocked, action):
                     try:
-                        with open(path) as f:
-                            print(f'[Python] READ  {label:<26} -> OK: {f.read().strip()!r}')
+                        detail = action()
+                        outcome = 'OK'
                     except PermissionError as e:
-                        print(f'[Python] READ  {label:<26} -> BLOCKED: {e}')
+                        detail = str(e)
+                        outcome = 'BLOCKED'
+                    passed = (outcome == 'BLOCKED') == expect_blocked
+                    results.append(passed)
+                    status = 'PASSED' if passed else 'FAILED'
+                    print(f'[Python] {status:<6} {outcome:<8} {label:<32} {detail}')
 
-                def try_write(label, path, mode='w'):
-                    try:
-                        with open(path, mode) as f:
-                            f.write('written by python\\n')
-                        print(f'[Python] WRITE {label:<26} -> OK')
-                    except PermissionError as e:
-                        print(f'[Python] WRITE {label:<26} -> BLOCKED: {e}')
+                def list_dir(path):
+                    return os.listdir(path)
 
-                def try_list(label, path):
-                    try:
-                        print(f'[Python] LIST  {label:<26} -> OK: {os.listdir(path)}')
-                    except PermissionError as e:
-                        print(f'[Python] LIST  {label:<26} -> BLOCKED: {e}')
+                def read_file(path):
+                    with open(path) as f:
+                        return f.read().strip()
 
-                try_list('own folder', %1$s)
-                try_read('own file', %2$s)
-                try_write('own file (append)', %2$s, 'a')
-                try_list('other process\\'s folder', %3$s)
-                try_read('other process\\'s file', %4$s)
-                try_write('plant file in other\\'s folder', %5$s)
+                def write_file(path, mode='w'):
+                    with open(path, mode) as f:
+                        f.write('written by python\\n')
+                    return 'wrote line'
+
+                check('list own folder', False, lambda: list_dir(%1$s))
+                check('read own file', False, lambda: read_file(%2$s))
+                check('write own file (append)', False, lambda: write_file(%2$s, 'a'))
+                check("list other process's folder", True, lambda: list_dir(%3$s))
+                check("read other process's file", True, lambda: read_file(%4$s))
+                check("plant file in other's folder", True, lambda: write_file(%5$s))
+
+                passed_count = sum(results)
+                print(f'[Python] SUMMARY: {passed_count}/{len(results)} checks passed')
+                sys.exit(0 if passed_count == len(results) else 1)
                 """.formatted(
                 pyLiteral(ownDir), pyLiteral(ownFile), pyLiteral(targetOtherDir), pyLiteral(otherFile), pyLiteral(plantedFile)
         );
@@ -174,7 +185,9 @@ public class LandlockPythonSandbox {
                 .inheritIO()
                 .start();
 
-        pythonProc.waitFor();
+        int exitCode = pythonProc.waitFor();
+        System.out.printf("[%s] Python exited with code %d (%s)%n",
+                mode, exitCode, exitCode == 0 ? "all checks passed" : "one or more checks FAILED");
     }
 
     /** Renders a path as a single-quoted Python string literal for embedding in the inline script. */
