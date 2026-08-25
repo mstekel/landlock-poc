@@ -57,11 +57,17 @@ public class LandlockPythonSandbox {
                     LANDLOCK_ACCESS_FS_MAKE_FIFO | LANDLOCK_ACCESS_FS_MAKE_BLOCK |
                     LANDLOCK_ACCESS_FS_MAKE_SYM;
 
+    private static final String DIVIDER = "-".repeat(60);
+
     public static void main(String[] args) throws Throwable {
         if (args.length > 0 && args[0].startsWith("--child-")) {
-            runChildProcess(args[0]);
-            return;
+            // Propagate the Python checks' pass/fail as this JVM's own exit
+            // code, so the parent below can report a real PASSED/FAILED per
+            // process instead of always seeing 0.
+            System.exit(runChildProcess(args[0]));
         }
+
+        System.out.println("=== Landlock Python Sandbox Demo ===");
 
         // Setup directories, each with a private file for the read/write checks below.
         Path dir1 = Path.of("/tmp/python_proc1");
@@ -71,7 +77,8 @@ public class LandlockPythonSandbox {
         Files.writeString(dir1.resolve("secret.txt"), "secret data belonging to process 1\n");
         Files.writeString(dir2.resolve("secret.txt"), "secret data belonging to process 2\n");
 
-        System.out.println("Spawning isolated Python sub-processes...");
+        System.out.println("Spawning two isolated Python sub-processes (P1, P2)...");
+        System.out.println(DIVIDER);
 
         // Launch Process 1 (Allowed /tmp/python_proc1, Denied /tmp/python_proc2)
         Process p1 = new ProcessBuilder("java",
@@ -85,15 +92,22 @@ public class LandlockPythonSandbox {
                 LandlockPythonSandbox.class.getName(), "--child-2")
                 .inheritIO().start();
 
-        p1.waitFor();
-        p2.waitFor();
+        int exit1 = p1.waitFor();
+        int exit2 = p2.waitFor();
+
+        System.out.println(DIVIDER);
+        System.out.println("=== Overall result ===");
+        System.out.printf("P1: %s%n", exit1 == 0 ? "PASSED" : "FAILED");
+        System.out.printf("P2: %s%n", exit2 == 0 ? "PASSED" : "FAILED");
     }
 
-    private static void runChildProcess(String mode) throws Throwable {
+    /** Runs as a re-exec'd child JVM (see main()); returns the embedded Python script's exit code. */
+    private static int runChildProcess(String mode) throws Throwable {
+        String procTag = "P" + mode.substring("--child-".length());
         String ownDir = mode.equals("--child-1") ? "/tmp/python_proc1" : "/tmp/python_proc2";
         String targetOtherDir = mode.equals("--child-1") ? "/tmp/python_proc2" : "/tmp/python_proc1";
 
-        System.out.printf("[%s] Applying Landlock restrictions...%n", mode);
+        System.out.printf("[%s] Applying Landlock restrictions...%n", procTag);
 
         // Required by Landlock before restricting self without CAP_SYS_ADMIN
         // PR_SET_NO_NEW_PRIVS = 38
@@ -124,11 +138,11 @@ public class LandlockPythonSandbox {
 
         if (restrictRes < 0) throw new RuntimeException("landlock_restrict_self failed");
 
-        System.out.printf("[%s] Landlock enforced successfully. Launching Python execution test...%n", mode);
+        System.out.printf("[%s] Landlock enforced. Launching Python execution test...%n", procTag);
 
         String ownFile = ownDir + "/secret.txt";
         String otherFile = targetOtherDir + "/secret.txt";
-        String plantedFile = targetOtherDir + "/planted_by_" + mode.substring("--child-".length()) + ".txt";
+        String plantedFile = targetOtherDir + "/planted_by_" + procTag + ".txt";
 
         // Run an inline Python script to test filesystem isolation. The script
         // itself calls no Landlock API and has no idea it's sandboxed -- the
@@ -137,10 +151,14 @@ public class LandlockPythonSandbox {
         // happen (own folder -> allowed, other process's folder -> blocked)
         // and prints PASSED/FAILED based on whether the actual outcome
         // matched that expectation, so a BLOCKED result is clearly flagged
-        // as correct rather than looking like a failure.
+        // as correct rather than looking like a failure. Every line is
+        // prefixed with this process's tag (P1/P2) so the two processes'
+        // interleaved output stays attributable even when they run
+        // concurrently and their lines land next to each other.
         String pythonScript = """
                 import os, sys
 
+                TAG = %6$s
                 results = []
 
                 def check(label, expect_blocked, action):
@@ -153,7 +171,7 @@ public class LandlockPythonSandbox {
                     passed = (outcome == 'BLOCKED') == expect_blocked
                     results.append(passed)
                     status = 'PASSED' if passed else 'FAILED'
-                    print(f'[Python] {status:<6} {outcome:<8} {label:<32} {detail}')
+                    print(f'[{TAG}] {status:<6} {outcome:<8} {label:<32} {detail}')
 
                 def list_dir(path):
                     return os.listdir(path)
@@ -175,10 +193,11 @@ public class LandlockPythonSandbox {
                 check("plant file in other's folder", True, lambda: write_file(%5$s))
 
                 passed_count = sum(results)
-                print(f'[Python] SUMMARY: {passed_count}/{len(results)} checks passed')
+                print(f'[{TAG}] SUMMARY: {passed_count}/{len(results)} checks passed')
                 sys.exit(0 if passed_count == len(results) else 1)
                 """.formatted(
-                pyLiteral(ownDir), pyLiteral(ownFile), pyLiteral(targetOtherDir), pyLiteral(otherFile), pyLiteral(plantedFile)
+                pyLiteral(ownDir), pyLiteral(ownFile), pyLiteral(targetOtherDir), pyLiteral(otherFile), pyLiteral(plantedFile),
+                pyLiteral(procTag)
         );
 
         Process pythonProc = new ProcessBuilder("python3", "-c", pythonScript)
@@ -187,7 +206,8 @@ public class LandlockPythonSandbox {
 
         int exitCode = pythonProc.waitFor();
         System.out.printf("[%s] Python exited with code %d (%s)%n",
-                mode, exitCode, exitCode == 0 ? "all checks passed" : "one or more checks FAILED");
+                procTag, exitCode, exitCode == 0 ? "all checks passed" : "one or more checks FAILED");
+        return exitCode;
     }
 
     /** Renders a path as a single-quoted Python string literal for embedding in the inline script. */
