@@ -219,8 +219,8 @@ public class LandlockPythonSandbox {
         File f = new File(path);
         if (!f.exists()) return;
 
-        // O_PATH = 00100000 (0x20000)
-        int fd = CLib.INSTANCE.open(path, 0x20000);
+        // O_PATH 0x200000
+        int fd = CLib.INSTANCE.open(path, 0x200000);
         if (fd < 0) return;
 
         // struct landlock_path_beneath_attr { __u64 allowed_access; __s32 parent_fd; } __attribute__((packed));
