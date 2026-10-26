@@ -75,6 +75,8 @@ public class LandlockPythonSandbox {
 
     private static final long FS_ACCESS_READ = LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR;
 
+    private static final String PYTHON_HOME = "/opt/pyramid/python";
+
     private static final String DIVIDER = "-".repeat(60);
 
     public static void main(String[] args) throws Throwable {
@@ -179,6 +181,7 @@ public class LandlockPythonSandbox {
         allowPath((int) rulesetFd, "/lib", FS_ACCESS_READ_EXEC);
         allowPath((int) rulesetFd, "/lib64", FS_ACCESS_READ_EXEC);
         allowPath((int) rulesetFd, "/etc", FS_ACCESS_READ);
+        allowPath((int) rulesetFd, PYTHON_HOME, FS_ACCESS_READ_EXEC);
         // The JVM must still be able to exec its own spawn helper (java.home/lib/jspawnhelper)
         // when the JDK lives outside the system paths above.
         allowPath((int) rulesetFd, System.getProperty("java.home"), FS_ACCESS_READ_EXEC);
@@ -283,7 +286,7 @@ public class LandlockPythonSandbox {
                 pyLiteral(procTag), pyLiteral(moveSrc), pyLiteral(moveDst), pyLiteral(linkPath)
         );
 
-        Process pythonProc = new ProcessBuilder("python3", "-c", pythonScript)
+        Process pythonProc = new ProcessBuilder(PYTHON_HOME + "/bin/python3", "-c", pythonScript)
                 .inheritIO()
                 .start();
 
