@@ -1,8 +1,10 @@
+import com.sun.jna.LastErrorException;
 import com.sun.jna.Library;
 import com.sun.jna.Memory;
 import com.sun.jna.Native;
 
 import java.io.File;
+import java.util.concurrent.CompletableFuture;
 import java.nio.file.Files;
 import java.nio.file.Path;
 
@@ -16,13 +18,17 @@ public class LandlockPythonSandbox {
         // syscall(sysno, ...): declared with Java varargs so JNA marshals
         // whatever arguments each landlock call needs, matching the C
         // variadic declaration.
-        long syscall(long number, Object... args);
+        // "throws LastErrorException" makes JNA capture errno right after the
+        // call and raise it when set, so failures can report the real errno.
+        long syscall(long number, Object... args) throws LastErrorException;
 
         int open(String path, int flags);
 
         int close(int fd);
 
-        int prctl(int option, long arg2, long arg3, long arg4, long arg5);
+        int prctl(int option, long arg2, long arg3, long arg4, long arg5) throws LastErrorException;
+
+        String strerror(int errnum);
     }
 
     // Syscall numbers for x86_64
@@ -48,7 +54,13 @@ public class LandlockPythonSandbox {
     private static final long LANDLOCK_ACCESS_FS_MAKE_BLOCK = 1L << 11;
     private static final long LANDLOCK_ACCESS_FS_MAKE_SYM = 1L << 12;
 
-    private static final long FS_ACCESS_ALL =
+    // Added by later Landlock ABIs; only requested when the kernel supports them.
+    private static final long LANDLOCK_ACCESS_FS_REFER = 1L << 13;    // ABI 2 (5.19)
+    private static final long LANDLOCK_ACCESS_FS_TRUNCATE = 1L << 14; // ABI 3 (6.2)
+
+    private static final long LANDLOCK_CREATE_RULESET_VERSION = 1L << 0;
+
+    private static final long FS_ACCESS_V1 =
             LANDLOCK_ACCESS_FS_EXECUTE | LANDLOCK_ACCESS_FS_WRITE_FILE |
                     LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR |
                     LANDLOCK_ACCESS_FS_REMOVE_DIR | LANDLOCK_ACCESS_FS_REMOVE_FILE |
@@ -56,6 +68,12 @@ public class LandlockPythonSandbox {
                     LANDLOCK_ACCESS_FS_MAKE_REG | LANDLOCK_ACCESS_FS_MAKE_SOCK |
                     LANDLOCK_ACCESS_FS_MAKE_FIFO | LANDLOCK_ACCESS_FS_MAKE_BLOCK |
                     LANDLOCK_ACCESS_FS_MAKE_SYM;
+
+    // Read + execute only: enough to run python3 and load libraries, nothing writable.
+    private static final long FS_ACCESS_READ_EXEC =
+            LANDLOCK_ACCESS_FS_EXECUTE | LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR;
+
+    private static final long FS_ACCESS_READ = LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR;
 
     private static final String DIVIDER = "-".repeat(60);
 
@@ -67,7 +85,8 @@ public class LandlockPythonSandbox {
             System.exit(runChildProcess(args[0]));
         }
 
-        System.out.println("=== Landlock Python Sandbox Demo ===");
+        System.out.println("Landlock Python sandbox demo");
+        System.out.println("Each process runs Python restricted to its own folder.");
 
         // Setup directories, each with a private file for the read/write checks below.
         Path dir1 = Path.of("/tmp/python_proc1");
@@ -77,28 +96,39 @@ public class LandlockPythonSandbox {
         Files.writeString(dir1.resolve("secret.txt"), "secret data belonging to process 1\n");
         Files.writeString(dir2.resolve("secret.txt"), "secret data belonging to process 2\n");
 
-        System.out.println("Spawning two isolated Python sub-processes (P1, P2)...");
-        System.out.println(DIVIDER);
-
-        // Launch Process 1 (Allowed /tmp/python_proc1, Denied /tmp/python_proc2)
-        Process p1 = new ProcessBuilder("java",
-                "-cp", System.getProperty("java.class.path"),
-                LandlockPythonSandbox.class.getName(), "--child-1")
-                .inheritIO().start();
-
-        // Launch Process 2 (Allowed /tmp/python_proc2, Denied /tmp/python_proc1)
-        Process p2 = new ProcessBuilder("java",
-                "-cp", System.getProperty("java.class.path"),
-                LandlockPythonSandbox.class.getName(), "--child-2")
-                .inheritIO().start();
+        // Launch Process 1 (Allowed /tmp/python_proc1, Denied /tmp/python_proc2) and
+        // Process 2 (the reverse). Output is captured and printed one process at a
+        // time so the two don't interleave.
+        Process p1 = startChild("--child-1");
+        Process p2 = startChild("--child-2");
+        CompletableFuture<String> out1 = CompletableFuture.supplyAsync(() -> readAll(p1));
+        CompletableFuture<String> out2 = CompletableFuture.supplyAsync(() -> readAll(p2));
 
         int exit1 = p1.waitFor();
         int exit2 = p2.waitFor();
 
+        System.out.println();
+        System.out.println(out1.get());
+        System.out.println(out2.get());
         System.out.println(DIVIDER);
-        System.out.println("=== Overall result ===");
-        System.out.printf("P1: %s%n", exit1 == 0 ? "PASSED" : "FAILED");
-        System.out.printf("P2: %s%n", exit2 == 0 ? "PASSED" : "FAILED");
+        System.out.printf("Result:  P1 %s   P2 %s%n", exit1 == 0 ? "PASSED" : "FAILED", exit2 == 0 ? "PASSED" : "FAILED");
+        System.exit(exit1 == 0 && exit2 == 0 ? 0 : 1);
+    }
+
+    private static Process startChild(String mode) throws Exception {
+        return new ProcessBuilder("java",
+                "-cp", System.getProperty("java.class.path"),
+                LandlockPythonSandbox.class.getName(), mode)
+                .redirectErrorStream(true)
+                .start();
+    }
+
+    private static String readAll(Process p) {
+        try {
+            return new String(p.getInputStream().readAllBytes());
+        } catch (Exception e) {
+            return "(could not read output: " + e + ")";
+        }
     }
 
     /** Runs as a re-exec'd child JVM (see main()); returns the embedded Python script's exit code. */
@@ -107,42 +137,74 @@ public class LandlockPythonSandbox {
         String ownDir = mode.equals("--child-1") ? "/tmp/python_proc1" : "/tmp/python_proc2";
         String targetOtherDir = mode.equals("--child-1") ? "/tmp/python_proc2" : "/tmp/python_proc1";
 
-        System.out.printf("[%s] Applying Landlock restrictions...%n", procTag);
+        // Why the whole child JVM is restricted: Landlock restrictions apply to
+        // the calling thread and are inherited across fork/exec, so restricting
+        // this JVM before it spawns python3 is what confines the Python script.
+        // The restriction is irreversible, hence one re-exec'd JVM per sandbox.
 
         // Required by Landlock before restricting self without CAP_SYS_ADMIN
         // PR_SET_NO_NEW_PRIVS = 38
-        int ret = CLib.INSTANCE.prctl(38, 1L, 0L, 0L, 0L);
-        if (ret < 0) throw new RuntimeException("prctl(PR_SET_NO_NEW_PRIVS) failed");
+        try {
+            CLib.INSTANCE.prctl(38, 1L, 0L, 0L, 0L);
+        } catch (LastErrorException e) {
+            throw sandboxFailure("prctl(PR_SET_NO_NEW_PRIVS)", e);
+        }
+
+        // Negotiate the ABI: REFER (ABI 2) and TRUNCATE (ABI 3) are only valid
+        // in handled_access_fs on kernels that know them.
+        long abi;
+        try {
+            abi = CLib.INSTANCE.syscall(SYS_LANDLOCK_CREATE_RULESET, 0L, 0L, LANDLOCK_CREATE_RULESET_VERSION);
+        } catch (LastErrorException e) {
+            throw sandboxFailure("landlock_create_ruleset(VERSION)", e);
+        }
+        long handled = FS_ACCESS_V1;
+        if (abi >= 2) handled |= LANDLOCK_ACCESS_FS_REFER;
+        if (abi >= 3) handled |= LANDLOCK_ACCESS_FS_TRUNCATE;
 
         // 1. Create Ruleset
         // struct landlock_ruleset_attr { __u64 handled_access_fs; };
         Memory attr = new Memory(8);
-        attr.setLong(0, FS_ACCESS_ALL);
+        attr.setLong(0, handled);
 
-        long rulesetFd = CLib.INSTANCE.syscall(SYS_LANDLOCK_CREATE_RULESET, attr, 8L, 0L);
-        if (rulesetFd < 0) throw new RuntimeException("landlock_create_ruleset failed: " + rulesetFd);
+        long rulesetFd;
+        try {
+            rulesetFd = CLib.INSTANCE.syscall(SYS_LANDLOCK_CREATE_RULESET, attr, 8L, 0L);
+        } catch (LastErrorException e) {
+            throw sandboxFailure("landlock_create_ruleset", e);
+        }
 
-        // 2. Allow system dependencies (Python runtime, shared libs, system /dev)
-        allowPath((int) rulesetFd, "/usr", FS_ACCESS_ALL);
-        allowPath((int) rulesetFd, "/lib", FS_ACCESS_ALL);
-        allowPath((int) rulesetFd, "/lib64", FS_ACCESS_ALL);
-        allowPath((int) rulesetFd, "/etc", LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR);
+        // 2. Allow system dependencies read-only (Python runtime, shared libs)
+        allowPath((int) rulesetFd, "/usr", FS_ACCESS_READ_EXEC);
+        allowPath((int) rulesetFd, "/lib", FS_ACCESS_READ_EXEC);
+        allowPath((int) rulesetFd, "/lib64", FS_ACCESS_READ_EXEC);
+        allowPath((int) rulesetFd, "/etc", FS_ACCESS_READ);
+        // The JVM must still be able to exec its own spawn helper (java.home/lib/jspawnhelper)
+        // when the JDK lives outside the system paths above.
+        allowPath((int) rulesetFd, System.getProperty("java.home"), FS_ACCESS_READ_EXEC);
 
-        // 3. Allow process-specific workspace directory ONLY
-        allowPath((int) rulesetFd, ownDir, FS_ACCESS_ALL);
+        // 3. Allow process-specific workspace directory ONLY (full access, incl. REFER/TRUNCATE if handled)
+        allowPath((int) rulesetFd, ownDir, handled);
 
         // 4. Enforce Landlock ruleset on the current process
-        long restrictRes = CLib.INSTANCE.syscall(SYS_LANDLOCK_RESTRICT_SELF, rulesetFd, 0L);
+        try {
+            CLib.INSTANCE.syscall(SYS_LANDLOCK_RESTRICT_SELF, rulesetFd, 0L);
+        } catch (LastErrorException e) {
+            throw sandboxFailure("landlock_restrict_self", e);
+        } finally {
+            CLib.INSTANCE.close((int) rulesetFd);
+        }
 
-        CLib.INSTANCE.close((int) rulesetFd);
-
-        if (restrictRes < 0) throw new RuntimeException("landlock_restrict_self failed");
-
-        System.out.printf("[%s] Landlock enforced. Launching Python execution test...%n", procTag);
+        System.out.println(DIVIDER);
+        System.out.printf("%s  sandboxed to %s  (Landlock ABI v%d)%n", procTag, ownDir, abi);
+        System.out.println(DIVIDER);
 
         String ownFile = ownDir + "/secret.txt";
         String otherFile = targetOtherDir + "/secret.txt";
         String plantedFile = targetOtherDir + "/planted_by_" + procTag + ".txt";
+        String moveSrc = ownDir + "/move_me.txt";
+        String moveDst = targetOtherDir + "/moved_by_" + procTag + ".txt";
+        String linkPath = targetOtherDir + "/link_by_" + procTag;
 
         // Run an inline Python script to test filesystem isolation. The script
         // itself calls no Landlock API and has no idea it's sandboxed -- the
@@ -156,22 +218,30 @@ public class LandlockPythonSandbox {
         // interleaved output stays attributable even when they run
         // concurrently and their lines land next to each other.
         String pythonScript = """
-                import os, sys
+                import errno, os, sys
 
-                TAG = %6$s
                 results = []
 
-                def check(label, expect_blocked, action):
+                # errnos that mean "Landlock denied it". EXDEV is what a cross-directory
+                # rename/link returns when FS_REFER is not granted.
+                DENIED = (errno.EACCES, errno.EPERM)
+
+                def check(label, expect_blocked, action, denied=DENIED):
+                    note = ''
                     try:
                         detail = action()
                         outcome = 'OK'
-                    except PermissionError as e:
+                    except OSError as e:  # PermissionError is a subclass
                         detail = str(e)
-                        outcome = 'BLOCKED'
-                    passed = (outcome == 'BLOCKED') == expect_blocked
+                        outcome = 'BLOCKED' if e.errno in denied else 'ERROR'
+                        note = errno.errorcode.get(e.errno, '')
+                    passed = outcome == ('BLOCKED' if expect_blocked else 'OK')
                     results.append(passed)
-                    status = 'PASSED' if passed else 'FAILED'
-                    print(f'[{TAG}] {status:<6} {outcome:<8} {label:<32} {detail}')
+                    expected = 'blocked' if expect_blocked else 'allowed'
+                    if passed:
+                        print(f'  [PASS] {expected:<8} {label:<30} {note}')
+                    else:
+                        print(f'  [FAIL] {expected:<8} {label:<30} got {outcome}: {detail}')
 
                 def list_dir(path):
                     return os.listdir(path)
@@ -185,19 +255,32 @@ public class LandlockPythonSandbox {
                         f.write('written by python\\n')
                     return 'wrote line'
 
+                def move_across(src, dst):
+                    write_file(src)
+                    try:
+                        os.rename(src, dst)
+                    finally:
+                        if os.path.exists(src):
+                            os.remove(src)
+                    return 'moved'
+
                 check('list own folder', False, lambda: list_dir(%1$s))
                 check('read own file', False, lambda: read_file(%2$s))
                 check('write own file (append)', False, lambda: write_file(%2$s, 'a'))
                 check("list other process's folder", True, lambda: list_dir(%3$s))
                 check("read other process's file", True, lambda: read_file(%4$s))
                 check("plant file in other's folder", True, lambda: write_file(%5$s))
+                check("truncate other's file", True, lambda: os.truncate(%4$s, 0))
+                check('move file across boundary', True, lambda: move_across(%7$s, %8$s), DENIED + (errno.EXDEV,))
+                check('write under /usr', True, lambda: write_file('/usr/landlock_probe'))
+                check("symlink in other's folder", True, lambda: os.symlink(%2$s, %9$s))
 
                 passed_count = sum(results)
-                print(f'[{TAG}] SUMMARY: {passed_count}/{len(results)} checks passed')
+                print(f'  -> {passed_count}/{len(results)} checks passed')
                 sys.exit(0 if passed_count == len(results) else 1)
                 """.formatted(
                 pyLiteral(ownDir), pyLiteral(ownFile), pyLiteral(targetOtherDir), pyLiteral(otherFile), pyLiteral(plantedFile),
-                pyLiteral(procTag)
+                pyLiteral(procTag), pyLiteral(moveSrc), pyLiteral(moveDst), pyLiteral(linkPath)
         );
 
         Process pythonProc = new ProcessBuilder("python3", "-c", pythonScript)
@@ -205,9 +288,12 @@ public class LandlockPythonSandbox {
                 .start();
 
         int exitCode = pythonProc.waitFor();
-        System.out.printf("[%s] Python exited with code %d (%s)%n",
-                procTag, exitCode, exitCode == 0 ? "all checks passed" : "one or more checks FAILED");
         return exitCode;
+    }
+
+    private static RuntimeException sandboxFailure(String call, LastErrorException e) {
+        int errno = e.getErrorCode();
+        return new RuntimeException("%s failed: errno %d (%s)".formatted(call, errno, CLib.INSTANCE.strerror(errno)));
     }
 
     /** Renders a path as a single-quoted Python string literal for embedding in the inline script. */
