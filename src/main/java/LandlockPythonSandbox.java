@@ -286,12 +286,18 @@ public class LandlockPythonSandbox {
                 pyLiteral(procTag), pyLiteral(moveSrc), pyLiteral(moveDst), pyLiteral(linkPath)
         );
 
-        Process pythonProc = new ProcessBuilder(PYTHON_HOME + "/bin/python3", "-c", pythonScript)
+        Process pythonProc = new ProcessBuilder(pythonExecutable(), "-c", pythonScript)
                 .inheritIO()
                 .start();
 
         int exitCode = pythonProc.waitFor();
         return exitCode;
+    }
+
+    /** The bundled interpreter if installed, otherwise python3 from PATH (under the allowed /usr). */
+    private static String pythonExecutable() {
+        String bundled = PYTHON_HOME + "/bin/python3";
+        return Files.isExecutable(Path.of(bundled)) ? bundled : "python3";
     }
 
     private static RuntimeException sandboxFailure(String call, LastErrorException e) {
