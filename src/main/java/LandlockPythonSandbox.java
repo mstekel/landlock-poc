@@ -273,7 +273,10 @@ public class LandlockPythonSandbox {
                 check("list other process's folder", True, lambda: list_dir(%3$s))
                 check("read other process's file", True, lambda: read_file(%4$s))
                 check("plant file in other's folder", True, lambda: write_file(%5$s))
-                check("truncate other's file", True, lambda: os.truncate(%4$s, 0))
+                if %10$d >= 3:
+                    check("truncate other's file", True, lambda: os.truncate(%4$s, 0))
+                else:
+                    print("  [SKIP] blocked  truncate other's file          needs Landlock ABI v3 (kernel 6.2+)")
                 check('move file across boundary', True, lambda: move_across(%7$s, %8$s), DENIED + (errno.EXDEV,))
                 check('write under /usr', True, lambda: write_file('/usr/landlock_probe'))
                 check("symlink in other's folder", True, lambda: os.symlink(%2$s, %9$s))
@@ -283,7 +286,7 @@ public class LandlockPythonSandbox {
                 sys.exit(0 if passed_count == len(results) else 1)
                 """.formatted(
                 pyLiteral(ownDir), pyLiteral(ownFile), pyLiteral(targetOtherDir), pyLiteral(otherFile), pyLiteral(plantedFile),
-                pyLiteral(procTag), pyLiteral(moveSrc), pyLiteral(moveDst), pyLiteral(linkPath)
+                pyLiteral(procTag), pyLiteral(moveSrc), pyLiteral(moveDst), pyLiteral(linkPath), abi
         );
 
         Process pythonProc = new ProcessBuilder(pythonExecutable(), "-c", pythonScript)
